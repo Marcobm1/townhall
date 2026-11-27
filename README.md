@@ -29,15 +29,21 @@ web UI (`/townhall`) with live SSE streaming, Telegram alerts, and task bridges.
     or turn cap (`max_turns`) is reached, then a moderator closes with a summary
     and conclusion so no session ever runs away or burns quotas indefinitely.
 
-## Quick start (Phase 1 demo)
+## Quick start
 
 ```bash
 pip install -e ".[dev]"
 
-# Run a local offline demo (4 mock participants: Gemini, Codex, Claude + consensus OpenCode guest)
+# 1. Offline demo (4 mock participants: Gemini, Codex, Claude + consensus OpenCode guest)
 townhall demo "Review the project homepage and decide what is missing"
 
-# Inspect saved sessions
+# 2. Check which real CLIs are detected locally (claude, codex, agy, opencode)
+townhall adapters
+
+# 3. Run a real read-only Town Hall over a git repository (uses a disposable detached worktree)
+townhall run "Review the project status and list what is missing" --workspace /path/to/repo
+
+# 4. Inspect and export saved sessions
 townhall list
 townhall show <session-id>
 townhall export <session-id> -o report.md

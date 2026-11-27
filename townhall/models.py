@@ -178,6 +178,7 @@ class SessionConfig:
     turn_timeout_seconds: float = 120.0
     moderator_id: str = ""        # empty => first core participant
     language: str = "es"
+    isolate_workspace: bool = True
 
     def __post_init__(self) -> None:
         if not self.topic or not self.topic.strip():

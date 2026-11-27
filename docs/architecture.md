@@ -113,8 +113,10 @@ see *why* that 4th model joined the table.
 - **Phase 1 (done):** Core models, consensus picker, `council` + `open_floor`
   engine with budgets & cancellation, SQLite WAL store, Markdown export, CLI
   demo, tests.
-- **Phase 2:** Read-only one-shot CLI adapters (`claude`, `codex`, `agy`,
-  `opencode`, OpenAI-compatible HTTP) + disposable `git worktree` guard.
+- **Phase 2 (done):** Read-only one-shot CLI adapters (`claude`, `codex`, `agy`,
+  `opencode`, stdlib OpenAI-compatible HTTP), `sanitize_env()` secret stripping,
+  automatic detached `disposable_worktree()` guard, and `townhall run` /
+  `townhall adapters`.
 - **Phase 3:** Recurring scheduler (e.g. weekly project reviews) + minimal
   standalone web UI (`townhall serve`).
 - **Phase 4:** Integration into Huo (`/townhall`) with live SSE, Huo bot

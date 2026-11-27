@@ -22,6 +22,7 @@ from .models import (
     TurnRequest,
     TurnResult,
 )
+from .sandbox import disposable_worktree
 
 EventCallback = Callable[[SessionEvent], None]
 ClockFn = Callable[[], float]
@@ -185,6 +186,17 @@ class TownHallEngine:
     ) -> SessionRecord:
         sid = session_id or uuid.uuid4().hex[:12]
         cancel = cancel_event or threading.Event()
+        with disposable_worktree(config.workspace, enabled=config.isolate_workspace) as ws:
+            return self._run_in_workspace(config, sid, cancel, ws.path, ws.isolated)
+
+    def _run_in_workspace(
+        self,
+        config: SessionConfig,
+        sid: str,
+        cancel: threading.Event,
+        effective_workspace: str,
+        workspace_isolated: bool,
+    ) -> SessionRecord:
         start_mono = self._clock()
         deadline = start_mono + config.max_duration_seconds
 
@@ -204,6 +216,7 @@ class TownHallEngine:
             "session_started",
             mode=config.mode,
             topic=record.topic,
+            workspace_isolated=workspace_isolated,
             participants=[p.to_dict() for p in participants],
         )
 
@@ -241,7 +254,7 @@ class TownHallEngine:
                         participant=p,
                         system_prompt=sys_p,
                         user_prompt=usr_p,
-                        workspace=config.workspace,
+                        workspace=effective_workspace,
                         timeout_seconds=turn_timeout(),
                         read_only=True,
                     )
@@ -271,11 +284,11 @@ class TownHallEngine:
         # -------------------------------------------- Main deliberation
         if config.mode == "council":
             self._run_council_phases(
-                config, record, participants, cancel, deadline, turn_timeout
+                config, record, participants, effective_workspace, cancel, deadline, turn_timeout
             )
         else:
             self._run_open_floor(
-                config, record, participants, cancel, deadline, remaining, turn_timeout
+                config, record, participants, effective_workspace, cancel, deadline, remaining, turn_timeout
             )
 
         if cancel.is_set():
@@ -312,7 +325,7 @@ class TownHallEngine:
                 participant=moderator,
                 system_prompt=sys_p,
                 user_prompt=usr_p,
-                workspace=config.workspace,
+                workspace=effective_workspace,
                 timeout_seconds=config.turn_timeout_seconds,
                 read_only=True,
             )
@@ -348,6 +361,7 @@ class TownHallEngine:
         config: SessionConfig,
         record: SessionRecord,
         participants: list[Participant],
+        effective_workspace: str,
         cancel: threading.Event,
         deadline: float,
         turn_timeout: Callable[[], float],
@@ -361,7 +375,7 @@ class TownHallEngine:
         indep_reqs = []
         for p in participants:
             sys_p, usr_p = prompts.independent_prompts(
-                record.topic, p, config.workspace, config.language
+                record.topic, p, effective_workspace, config.language
             )
             indep_reqs.append(
                 TurnRequest(
@@ -371,7 +385,7 @@ class TownHallEngine:
                     participant=p,
                     system_prompt=sys_p,
                     user_prompt=usr_p,
-                    workspace=config.workspace,
+                    workspace=effective_workspace,
                     timeout_seconds=turn_timeout(),
                     read_only=True,
                 )
@@ -409,7 +423,7 @@ class TownHallEngine:
                         participant=p,
                         system_prompt=sys_p,
                         user_prompt=usr_p,
-                        workspace=config.workspace,
+                        workspace=effective_workspace,
                         timeout_seconds=turn_timeout(),
                         read_only=True,
                     )
@@ -422,6 +436,7 @@ class TownHallEngine:
         config: SessionConfig,
         record: SessionRecord,
         participants: list[Participant],
+        effective_workspace: str,
         cancel: threading.Event,
         deadline: float,
         remaining: Callable[[], float],
@@ -453,7 +468,7 @@ class TownHallEngine:
                     participant=speaker,
                     system_prompt=sys_p,
                     user_prompt=usr_p,
-                    workspace=config.workspace,
+                    workspace=effective_workspace,
                     timeout_seconds=turn_timeout(),
                     read_only=True,
                 )
