@@ -19,6 +19,7 @@ from .models import (
     ConsensusSelection,
     GuestVote,
     Participant,
+    ScheduleSpec,
     SessionConfig,
     SessionEvent,
     SessionRecord,
@@ -26,6 +27,8 @@ from .models import (
     TurnResult,
 )
 from .sandbox import WorkspaceContext, disposable_worktree
+from .scheduler import TownHallScheduler, in_allowed_hours, is_schedule_due
+from .server import TownHallRuntime, create_server
 from .store import TownHallStore, render_markdown
 
 __version__ = "0.1.0"
@@ -44,17 +47,23 @@ __all__ = [
     "OpenCodeCLIAdapter",
     "Participant",
     "ParticipantAdapter",
+    "ScheduleSpec",
     "SessionConfig",
     "SessionEvent",
     "SessionRecord",
     "TownHallEngine",
+    "TownHallRuntime",
+    "TownHallScheduler",
     "TownHallStore",
     "TurnRequest",
     "TurnResult",
     "WorkspaceContext",
     "build_default_adapters",
+    "create_server",
     "discover_adapters",
     "disposable_worktree",
+    "in_allowed_hours",
+    "is_schedule_due",
     "opencode_readonly_config",
     "parse_guest_vote",
     "render_markdown",

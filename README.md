@@ -43,7 +43,15 @@ townhall adapters
 # 3. Run a real read-only Town Hall over a git repository (uses a disposable detached worktree)
 townhall run "Review the project status and list what is missing" --workspace /path/to/repo
 
-# 4. Inspect and export saved sessions
+# 4. Launch the standalone local web UI + recurring scheduler (add --demo to test offline)
+townhall serve --demo
+
+# 5. Manage weekly/daily scheduled reviews from the CLI
+townhall schedule add "Weekly review" "Check STATUS.md and missing tests" --hours 168 --allowed-hours 09:00-21:00
+townhall schedule list
+townhall schedule tick --demo
+
+# 6. Inspect and export saved sessions
 townhall list
 townhall show <session-id>
 townhall export <session-id> -o report.md

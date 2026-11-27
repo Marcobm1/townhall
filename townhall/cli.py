@@ -1,16 +1,19 @@
-"""Command-line interface for Town Hall (`townhall run|demo|adapters|list|show|export`)."""
+"""Command-line interface for Town Hall (`townhall run|demo|serve|schedule|adapters|list|show|export`)."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from .adapter import DemoAdapter
 from .cli_adapters import build_default_adapters, discover_adapters
 from .engine import TownHallEngine
-from .models import Participant, SessionConfig, SessionEvent
+from .models import Participant, ScheduleSpec, SessionConfig, SessionEvent
+from .scheduler import TownHallScheduler
+from .server import create_server
 from .store import TownHallStore, render_markdown
 
 DEFAULT_GUEST_POOL = [
@@ -91,6 +94,35 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="Run an offline simulated 4-agent Town Hall session.")
     _add_session_flags(demo)
 
+    serve = sub.add_parser("serve", help="Start the standalone Town Hall web UI & scheduler.")
+    serve.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
+    serve.add_argument("--port", type=int, default=8765, help="Port number (default: 8765).")
+    serve.add_argument("--demo", action="store_true", help="Use offline DemoAdapter instead of local CLIs.")
+    serve.add_argument("--poll-seconds", type=float, default=60.0, help="Scheduler poll interval in seconds.")
+
+    sched = sub.add_parser("schedule", help="Manage recurring Town Hall schedules (weekly/daily reviews).")
+    sched_sub = sched.add_subparsers(dest="sched_cmd", required=True)
+    sched_sub.add_parser("list", help="List saved schedules.")
+
+    s_add = sched_sub.add_parser("add", help="Create a recurring schedule.")
+    s_add.add_argument("name", help="Short schedule label (e.g. 'Weekly Huo review').")
+    s_add.add_argument("topic", help="Prompt or review goal.")
+    s_add.add_argument("--workspace", default="", help="Optional project folder (read-only).")
+    s_add.add_argument("--hours", type=float, default=168.0, help="Interval in hours (168 = weekly).")
+    s_add.add_argument("--allowed-hours", default="", help="Optional HH:MM-HH:MM window (e.g. 09:00-21:00).")
+    s_add.add_argument("--mode", choices=["council", "open_floor"], default="council")
+    s_add.add_argument("--max-seconds", type=float, default=600.0)
+    s_add.add_argument("--moderator", default="claude")
+
+    s_toggle = sched_sub.add_parser("toggle", help="Enable or pause a schedule.")
+    s_toggle.add_argument("schedule_id")
+
+    s_del = sched_sub.add_parser("delete", help="Delete a schedule.")
+    s_del.add_argument("schedule_id")
+
+    s_tick = sched_sub.add_parser("tick", help="Run all currently due schedules once.")
+    s_tick.add_argument("--demo", action="store_true", help="Use offline DemoAdapter.")
+
     sub.add_parser("adapters", help="Show which local AI CLIs are detected on this computer.")
 
     ls = sub.add_parser("list", help="List saved Town Hall sessions.")
@@ -105,6 +137,62 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _handle_schedule(args: argparse.Namespace, store: TownHallStore) -> int:
+    if args.sched_cmd == "list":
+        rows = store.list_schedules()
+        if not rows:
+            print("No schedules configured.")
+            return 0
+        for s in rows:
+            st = "on " if s.enabled else "off"
+            win = f" ({s.allowed_hours})" if s.allowed_hours else ""
+            print(f"{s.id}  [{st}]  every {s.interval_hours:g}h{win}  {s.name} — {s.topic[:60]}")
+        return 0
+
+    if args.sched_cmd == "add":
+        spec = ScheduleSpec(
+            id=uuid.uuid4().hex[:10],
+            name=args.name,
+            topic=args.topic,
+            participants=default_core_participants(),
+            mode=args.mode,
+            workspace=args.workspace,
+            guest_pool=list(DEFAULT_GUEST_POOL),
+            max_duration_seconds=args.max_seconds,
+            moderator_id=args.moderator,
+            interval_hours=args.hours,
+            allowed_hours=args.allowed_hours,
+        )
+        store.save_schedule(spec)
+        print(f"Created schedule {spec.id}: {spec.name} (every {spec.interval_hours:g}h)")
+        return 0
+
+    if args.sched_cmd == "toggle":
+        spec = store.get_schedule(args.schedule_id)
+        if spec is None:
+            print(f"Schedule not found: {args.schedule_id}", file=sys.stderr)
+            return 1
+        store.set_schedule_enabled(spec.id, not spec.enabled)
+        print(f"Schedule {spec.id} is now {'enabled' if not spec.enabled else 'paused'}.")
+        return 0
+
+    if args.sched_cmd == "delete":
+        if not store.delete_schedule(args.schedule_id):
+            print(f"Schedule not found: {args.schedule_id}", file=sys.stderr)
+            return 1
+        print(f"Deleted schedule {args.schedule_id}.")
+        return 0
+
+    if args.sched_cmd == "tick":
+        adapter = DemoAdapter() if args.demo else build_default_adapters()
+        scheduler = TownHallScheduler(store, adapter, on_event=_print_event)
+        ran = scheduler.tick()
+        print(f"Ran {len(ran)} due schedule(s).")
+        return 0
+
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "adapters":
@@ -115,6 +203,29 @@ def main(argv: list[str] | None = None) -> int:
 
     db_path = Path(args.db) if args.db else default_db_path()
     store = TownHallStore(db_path)
+
+    if args.cmd == "schedule":
+        return _handle_schedule(args, store)
+
+    if args.cmd == "serve":
+        server, runtime = create_server(
+            store,
+            host=args.host,
+            port=args.port,
+            demo=args.demo,
+            poll_seconds=args.poll_seconds,
+        )
+        runtime.start_background()
+        mode_str = "demo" if args.demo else "live"
+        print(f"Town Hall ({mode_str}) listening on http://{args.host}:{args.port} (DB: {db_path})")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            runtime.stop()
+            server.server_close()
+        return 0
 
     if args.cmd in ("demo", "run"):
         if args.cmd == "demo":

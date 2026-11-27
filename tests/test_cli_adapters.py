@@ -279,20 +279,24 @@ def test_disposable_worktree_isolates_and_discards_stray_writes_on_git_repo(tmp_
 def test_end_to_end_council_with_cli_adapters_and_disposable_worktree(tmp_path):
     repo = tmp_path / "site-repo"
     _init_git_repo(repo)
-    marker_file = tmp_path / "seen_workspaces.jsonl"
+    markers_dir = tmp_path / "seen_workspaces"
+    markers_dir.mkdir()
 
     universal_fake = _write_fake_cli(
         tmp_path,
         "fake_agent",
         f"""
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 
 mode = sys.argv[1]
 prompt = sys.stdin.read() if mode in ("claude", "codex") else sys.argv[-1]
-# Record the actual CWD received so the test proves isolation.
-with open({str(marker_file)!r}, "a", encoding="utf-8") as fh:
-    fh.write(json.dumps({{"mode": mode, "cwd": os.getcwd()}}) + "\\n")
+# Write one marker file per invocation to avoid concurrent append races on Windows.
+out_dir = Path({str(markers_dir)!r})
+(out_dir / f"{{mode}}-{{os.getpid()}}-{{time.time_ns()}}.json").write_text(
+    json.dumps({{"mode": mode, "cwd": os.getcwd()}}),
+    encoding="utf-8",
+)
 
 # Simulate a rogue write by gemini inside the worktree — must never reach original repo.
 if mode == "gemini":
@@ -350,8 +354,11 @@ else:
 
     # Every subprocess ran inside the isolated worktree, never inside `repo`,
     # and the rogue file written by gemini never touched `repo`.
-    cwds = [json.loads(ln)["cwd"] for ln in marker_file.read_text(encoding="utf-8").splitlines()]
-    assert cwds and all(Path(c).resolve() != repo.resolve() for c in cwds)
+    cwds = [
+        json.loads(p.read_text(encoding="utf-8"))["cwd"]
+        for p in sorted(markers_dir.glob("*.json"))
+    ]
+    assert len(cwds) >= 12 and all(Path(c).resolve() != repo.resolve() for c in cwds)
     assert not (repo / "rogue_gemini_edit.txt").exists()
 
 
