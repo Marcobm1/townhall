@@ -10,6 +10,7 @@ open_source: true
 tags: [tooling, ai-agents, multi-agent]
 links:
   Architecture: docs/architecture.md
+  Future ideas: docs/ideas.md
   Huo / Baton: https://github.com/Marcobm1/baton
 ---
 
@@ -39,4 +40,5 @@ links:
 - 2026-11-27: Support both structured `council` debates (with consensus selection of a 4th OpenCode guest model via majority → Borda count → deterministic tie-break) and time-boxed `open_floor` conversations that always conclude with a summary and conclusion when the clock or turn limit expires.
 
 ## Log
+- 2026-11-27 (antigravity): Recorded optional future "AI Village" free-roam timed mode with persistent memory and cost controls in `docs/ideas.md`.
 - 2026-11-27 (antigravity): Bootstrapped `Marcobm1/townhall` with architecture design (`docs/architecture.md`), Phase 1 stdlib-only deliberation engine, Borda consensus picker, SQLite WAL store, Markdown exporter, CLI, CI workflow, and test suite.
