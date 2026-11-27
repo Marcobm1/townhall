@@ -21,7 +21,10 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -191,6 +194,32 @@ def opencode_readonly_config() -> dict:
 
 
 # ----------------------------------------------------------- shared runner
+def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Best-effort termination of a CLI subprocess and any children it spawned."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                stdin=subprocess.DEVNULL,
+                **_NO_WINDOW,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _exec_cli(
     cmd: list[str],
     request: TurnRequest,
@@ -201,27 +230,112 @@ def _exec_cli(
     env = sanitize_env()
     if extra_env:
         env.update(extra_env)
-    cwd = request.workspace if request.workspace and os.path.isdir(request.workspace) else None
+
+    # When no workspace is chosen, run inside a clean empty temp dir so CLIs
+    # never accidentally inherit and read the host server's own repository.
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    if request.workspace and os.path.isdir(request.workspace):
+        cwd = request.workspace
+    else:
+        temp_dir = tempfile.TemporaryDirectory(prefix="townhall-empty-")
+        cwd = temp_dir.name
+
     t0 = time.monotonic()
+    cancel = request.cancel_event
+    if cancel is not None and cancel.is_set():
+        if temp_dir is not None:
+            temp_dir.cleanup()
+        return None, 0.0, "Cancelled"
+
+    group = {} if os.name == "nt" else {"start_new_session": True}
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=cwd,
             env=env,
-            input=stdin_text,
-            stdin=None if stdin_text is not None else subprocess.DEVNULL,
-            capture_output=True,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=request.timeout_seconds,
+            **group,
             **_NO_WINDOW,
         )
-        return proc, time.monotonic() - t0, ""
-    except subprocess.TimeoutExpired:
-        return None, time.monotonic() - t0, f"Timed out after {int(request.timeout_seconds)}s"
     except OSError as exc:
+        if temp_dir is not None:
+            temp_dir.cleanup()
         return None, time.monotonic() - t0, str(exc)
+
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+
+    def _drain(stream, bucket: list[str]) -> None:
+        if stream is None:
+            return
+        try:
+            bucket.append(stream.read())
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, out_chunks), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, err_chunks), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    if stdin_text is not None and proc.stdin is not None:
+        def _feed() -> None:
+            try:
+                proc.stdin.write(stdin_text)
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=_feed, daemon=True).start()
+
+    deadline = t0 + max(0.1, float(request.timeout_seconds))
+    err_msg = ""
+    try:
+        while proc.poll() is None:
+            if cancel is not None and cancel.is_set():
+                _kill_process_tree(proc)
+                err_msg = "Cancelled"
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                _kill_process_tree(proc)
+                err_msg = f"Timed out after {int(request.timeout_seconds)}s"
+                break
+            time.sleep(min(0.1, max(0.01, deadline - now)))
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+    finally:
+        if temp_dir is not None:
+            try:
+                temp_dir.cleanup()
+            except OSError:
+                pass
+
+    dur = time.monotonic() - t0
+    if err_msg:
+        return None, dur, err_msg
+    completed = subprocess.CompletedProcess(
+        args=cmd,
+        returncode=int(proc.returncode or 0),
+        stdout="".join(out_chunks),
+        stderr="".join(err_chunks),
+    )
+    return completed, dur, ""
 
 
 def _error_result(request: TurnRequest, error: str, duration: float = 0.0) -> TurnResult:
@@ -326,6 +440,10 @@ class CodexCLIAdapter:
         cmd = [*prefix, "exec", "-s", "read-only", "--color", "never"]
         if request.workspace and os.path.isdir(request.workspace):
             cmd.extend(["-C", request.workspace])
+            if not os.path.exists(os.path.join(request.workspace, ".git")):
+                cmd.append("--skip-git-repo-check")
+        else:
+            cmd.append("--skip-git-repo-check")
         if request.participant.model:
             cmd.extend(["-m", request.participant.model])
         if request.participant.effort:

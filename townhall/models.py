@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -58,6 +59,7 @@ class TurnRequest:
     workspace: str = ""
     timeout_seconds: float = 120.0
     read_only: bool = True
+    cancel_event: threading.Event | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

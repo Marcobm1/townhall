@@ -137,3 +137,37 @@ def resolve_consensus(
         votes=list(votes),
         scores=dict(borda_scores),
     )
+
+
+def rank_candidates(
+    selection: ConsensusSelection,
+    allowed_models: list[str],
+) -> list[str]:
+    """Return candidate guest models in strict consensus fallback order.
+
+    Starts with `selection.chosen_model`, then remaining scored candidates sorted
+    by Borda score -> primary votes -> model ID, then remaining pool entries.
+    """
+    primary_counts = Counter(v.primary for v in selection.votes if v.valid and v.primary)
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    def _add(model: str) -> None:
+        m = (model or "").strip()
+        if not m:
+            return
+        key = m.casefold()
+        if key not in seen:
+            seen.add(key)
+            ranked.append(m)
+
+    _add(selection.chosen_model)
+    scored = sorted(
+        selection.scores.keys(),
+        key=lambda m: (-int(selection.scores.get(m, 0)), -primary_counts.get(m, 0), m.casefold()),
+    )
+    for m in scored:
+        _add(m)
+    for m in allowed_models:
+        _add(m)
+    return ranked

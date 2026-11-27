@@ -13,6 +13,7 @@ from townhall import (
     SessionEvent,
     TownHallEngine,
     TurnRequest,
+    TurnResult,
 )
 
 
@@ -164,3 +165,75 @@ def test_cancellation_and_single_participant_failure_resilience():
     assert any(t.participant_id == "codex" and t.error == "CLI timed out" for t in rec.turns)
     assert rec.conclusion is not None
     assert "Plain text conclusion" in rec.conclusion.conclusion
+
+
+def test_guest_pool_deduplicates_core_models_and_falls_back_on_region_error():
+    from townhall import prompts
+
+    seen_vote_prompts: list[str] = []
+    debate_models: list[str] = []
+    events: list[str] = []
+
+    def handler(req: TurnRequest) -> str:
+        if req.phase == "vote_guest":
+            seen_vote_prompts.append(req.user_prompt)
+            return json.dumps({
+                "primary": "opencode-go/deepseek-v4-pro",
+                "secondary": "opencode-go/gemini-4-argon",
+                "reason": "independent second opinion",
+            })
+        if req.participant.model == "opencode-go/deepseek-v4-pro":
+            raise RuntimeError("This OpenCode Go model is hosted outside Europe and the United States.")
+        if req.phase == "debate":
+            debate_models.append(req.participant.model)
+        if req.phase == "synthesis":
+            return json.dumps({
+                "summary": "Fallback guest completed the council.",
+                "conclusion": "Ship the fix.",
+                "agreements": ["Resilience matters"],
+                "disagreements": [],
+                "action_items": ["Add fallback"],
+            })
+        return f"Position from {req.participant.name} ({req.participant.model})"
+
+    participants = [
+        Participant(id="gemini", name="Gemini", provider="gemini", model="gemini-4-neon", role="core"),
+        Participant(id="opencode_1", name="OpenCode #1", provider="opencode", model="opencode-go/claude-haiku-5-5", role="core"),
+    ]
+    cfg = SessionConfig(
+        topic="Test guest dedup and fallback",
+        participants=participants,
+        guest_pool=[
+            "opencode-go/claude-haiku-5-5",  # already in core -> must be excluded
+            "opencode-go/deepseek-v4-pro",   # fails with region error -> triggers fallback
+            "opencode-go/gemini-4-argon",    # #2 Borda candidate -> succeeds
+        ],
+        debate_rounds=1,
+        moderator_id="gemini",
+    )
+    engine = TownHallEngine(CallableAdapter(handler), on_event=lambda ev: events.append(ev.type))
+    rec = engine.run(cfg)
+
+    assert rec.status == "completed"
+    # Core model never appeared in the allowed guest candidate list.
+    assert seen_vote_prompts and all("- opencode-go/claude-haiku-5-5" not in p for p in seen_vote_prompts)
+    # Fallback replaced DeepSeek with Gemini 4 Argon before Debate Round 1.
+    assert "guest_fallback" in events
+    assert rec.guest_selection is not None
+    assert rec.guest_selection.chosen_model == "opencode-go/gemini-4-argon"
+    assert rec.guest_selection.method.endswith("_fallback")
+    assert "opencode-go/gemini-4-argon" in debate_models
+    assert "opencode-go/deepseek-v4-pro" not in debate_models
+
+    # Prompt budgeting keeps debate & synthesis prompts safely under Windows 32K CLI limit.
+    huge = "x" * 12000
+    big_turns = [
+        TurnResult("p1", "P1", "m1", "independent", 1, huge),
+        TurnResult("p2", "P2", "m2", "independent", 1, huge),
+        TurnResult("p3", "P3", "m3", "independent", 1, huge),
+        TurnResult("p4", "P4", "m4", "debate", 1, huge),
+    ]
+    s_sys, s_usr = prompts.synthesis_prompts("Big topic", participants[0], big_turns, rec.guest_selection, False, "es")
+    assert len(s_sys) + len(s_usr) < 26000
+    d_sys, d_usr = prompts.debate_prompts("Big topic", participants[0], 1, huge, big_turns[:3], "es")
+    assert len(d_sys) + len(d_usr) < 26000

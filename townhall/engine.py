@@ -10,7 +10,7 @@ from typing import Callable
 
 from . import prompts
 from .adapter import ParticipantAdapter
-from .consensus import extract_json_object, parse_guest_vote, resolve_consensus
+from .consensus import extract_json_object, parse_guest_vote, rank_candidates, resolve_consensus
 from .models import (
     Conclusion,
     ConsensusSelection,
@@ -26,6 +26,7 @@ from .sandbox import disposable_worktree
 
 EventCallback = Callable[[SessionEvent], None]
 ClockFn = Callable[[], float]
+MAX_GUEST_FALLBACKS = 2
 
 
 def _make_guest_participant(model_id: str, provider: str) -> Participant:
@@ -170,10 +171,19 @@ class TownHallEngine:
                 results_by_index[idx] = fut.result()
         return [results_by_index[i] for i in range(len(requests))]
 
-    def _pick_moderator(self, config: SessionConfig, participants: list[Participant]) -> Participant:
+    def _pick_moderator(
+        self,
+        config: SessionConfig,
+        participants: list[Participant],
+        ok_ids: set[str] | None = None,
+    ) -> Participant:
         if config.moderator_id:
             for p in participants:
-                if p.id == config.moderator_id:
+                if p.id == config.moderator_id and (ok_ids is None or p.id in ok_ids):
+                    return p
+        if ok_ids:
+            for p in participants:
+                if p.id in ok_ids:
                     return p
         return participants[0]
 
@@ -201,6 +211,11 @@ class TownHallEngine:
         deadline = start_mono + config.max_duration_seconds
 
         participants = list(config.participants)
+        core_models_lower = {p.model.strip().casefold() for p in participants if p.model.strip()}
+        effective_guest_pool = [
+            m for m in config.guest_pool if m.strip() and m.strip().casefold() not in core_models_lower
+        ]
+
         record = SessionRecord(
             id=sid,
             topic=config.topic.strip(),
@@ -236,15 +251,16 @@ class TownHallEngine:
             self._emit(sid, "session_cancelled")
             return record
 
-        # -------------------------------------------- Phase 0: Consensus 4th guest
-        if config.guest_pool:
+        # -------------------------------------------- Phase 0: Consensus guest
+        guest_candidates: list[str] = []
+        if effective_guest_pool:
             if cancel.is_set():
                 return mark_cancelled()
             self._emit(sid, "phase_started", phase="vote_guest", round_num=0)
             vote_reqs = []
             for p in participants:
                 sys_p, usr_p = prompts.vote_guest_prompts(
-                    record.topic, config.guest_pool, p, config.language
+                    record.topic, effective_guest_pool, p, config.language
                 )
                 vote_reqs.append(
                     TurnRequest(
@@ -257,17 +273,19 @@ class TownHallEngine:
                         workspace=effective_workspace,
                         timeout_seconds=turn_timeout(),
                         read_only=True,
+                        cancel_event=cancel,
                     )
                 )
             vote_results = self._run_parallel(vote_reqs)
             record.turns.extend(vote_results)
 
             ballots: list[GuestVote] = [
-                parse_guest_vote(r.participant_id, r.participant_name, r.content, config.guest_pool)
+                parse_guest_vote(r.participant_id, r.participant_name, r.content, effective_guest_pool)
                 for r in vote_results
             ]
-            selection: ConsensusSelection = resolve_consensus(ballots, config.guest_pool)
+            selection: ConsensusSelection = resolve_consensus(ballots, effective_guest_pool)
             record.guest_selection = selection
+            guest_candidates = rank_candidates(selection, effective_guest_pool)
             guest = _make_guest_participant(selection.chosen_model, config.guest_provider)
             participants.append(guest)
             self._emit(
@@ -284,7 +302,14 @@ class TownHallEngine:
         # -------------------------------------------- Main deliberation
         if config.mode == "council":
             self._run_council_phases(
-                config, record, participants, effective_workspace, cancel, deadline, turn_timeout
+                config,
+                record,
+                participants,
+                effective_workspace,
+                cancel,
+                deadline,
+                turn_timeout,
+                guest_candidates,
             )
         else:
             self._run_open_floor(
@@ -307,7 +332,8 @@ class TownHallEngine:
             self._emit(sid, "session_failed", error=record.error)
             return record
 
-        moderator = self._pick_moderator(config, participants)
+        ok_ids = {t.participant_id for t in substantive}
+        moderator = self._pick_moderator(config, participants, ok_ids=ok_ids)
         self._emit(sid, "phase_started", phase="synthesis", round_num=1, moderator_id=moderator.id)
         sys_p, usr_p = prompts.synthesis_prompts(
             record.topic,
@@ -328,9 +354,12 @@ class TownHallEngine:
                 workspace=effective_workspace,
                 timeout_seconds=config.turn_timeout_seconds,
                 read_only=True,
+                cancel_event=cancel,
             )
         )
         record.turns.append(synth_res)
+        if cancel.is_set():
+            return mark_cancelled()
         if synth_res.ok:
             record.conclusion = parse_conclusion(moderator, synth_res.content)
         else:
@@ -356,6 +385,80 @@ class TownHallEngine:
         )
         return record
 
+    def _try_guest_fallback(
+        self,
+        config: SessionConfig,
+        record: SessionRecord,
+        participants: list[Participant],
+        latest_round: list[TurnResult],
+        effective_workspace: str,
+        cancel: threading.Event,
+        deadline: float,
+        turn_timeout: Callable[[], float],
+        guest_candidates: list[str],
+    ) -> list[Participant]:
+        """If the consensus guest failed in Round 1, try next Borda candidates cleanly."""
+        guest_idx = next((i for i, p in enumerate(participants) if p.role == "guest"), None)
+        if guest_idx is None:
+            return participants
+        guest_res = next((t for t in latest_round if t.participant_id == participants[guest_idx].id), None)
+        if guest_res is None or guest_res.ok:
+            return participants
+
+        failed_model = participants[guest_idx].model
+        tried = {failed_model.casefold()}
+        fallbacks = [m for m in guest_candidates if m.casefold() not in tried][:MAX_GUEST_FALLBACKS]
+
+        for alt_model in fallbacks:
+            if cancel.is_set() or self._clock() >= deadline:
+                break
+            alt_guest = _make_guest_participant(alt_model, config.guest_provider)
+            sys_p, usr_p = prompts.independent_prompts(
+                record.topic, alt_guest, effective_workspace, config.language
+            )
+            alt_res = self._run_one(
+                TurnRequest(
+                    session_id=record.id,
+                    phase="independent",
+                    round_num=1,
+                    participant=alt_guest,
+                    system_prompt=sys_p,
+                    user_prompt=usr_p,
+                    workspace=effective_workspace,
+                    timeout_seconds=turn_timeout(),
+                    read_only=True,
+                    cancel_event=cancel,
+                )
+            )
+            record.turns.append(alt_res)
+            if alt_res.ok:
+                participants[guest_idx] = alt_guest
+                if record.guest_selection is not None:
+                    gs = record.guest_selection
+                    method = gs.method if gs.method.endswith("_fallback") else f"{gs.method}_fallback"
+                    record.guest_selection = ConsensusSelection(
+                        chosen_model=alt_model,
+                        method=method,
+                        votes=list(gs.votes),
+                        scores=dict(gs.scores),
+                    )
+                for idx, turn in enumerate(latest_round):
+                    if turn.participant_id == alt_guest.id:
+                        latest_round[idx] = alt_res
+                        break
+                self._emit(
+                    record.id,
+                    "guest_fallback",
+                    failed_model=failed_model,
+                    failed_error=guest_res.error,
+                    fallback_model=alt_model,
+                )
+                return participants
+
+        # All guest attempts failed: keep the failed turn for visibility, but drop the
+        # unreachable guest from subsequent debate rounds so we don't repeat errors.
+        return [p for p in participants if p.role != "guest"]
+
     def _run_council_phases(
         self,
         config: SessionConfig,
@@ -365,6 +468,7 @@ class TownHallEngine:
         cancel: threading.Event,
         deadline: float,
         turn_timeout: Callable[[], float],
+        guest_candidates: list[str],
     ) -> None:
         # Phase 1: Blind parallel independent analysis
         if self._clock() >= deadline:
@@ -388,10 +492,26 @@ class TownHallEngine:
                     workspace=effective_workspace,
                     timeout_seconds=turn_timeout(),
                     read_only=True,
+                    cancel_event=cancel,
                 )
             )
         latest_round = self._run_parallel(indep_reqs)
         record.turns.extend(latest_round)
+
+        if cancel.is_set():
+            return
+
+        active_participants = self._try_guest_fallback(
+            config,
+            record,
+            participants,
+            latest_round,
+            effective_workspace,
+            cancel,
+            deadline,
+            turn_timeout,
+            guest_candidates,
+        )
 
         # Phase 2: N parallel cross-critique rounds
         for rnum in range(1, config.debate_rounds + 1):
@@ -404,7 +524,7 @@ class TownHallEngine:
             self._emit(record.id, "phase_started", phase="debate", round_num=rnum)
             by_pid = {t.participant_id: t for t in latest_round}
             debate_reqs = []
-            for p in participants:
+            for p in active_participants:
                 own = by_pid.get(p.id)
                 peers = [t for t in latest_round if t.participant_id != p.id and t.ok]
                 sys_p, usr_p = prompts.debate_prompts(
@@ -426,6 +546,7 @@ class TownHallEngine:
                         workspace=effective_workspace,
                         timeout_seconds=turn_timeout(),
                         read_only=True,
+                        cancel_event=cancel,
                     )
                 )
             latest_round = self._run_parallel(debate_reqs)
@@ -471,6 +592,7 @@ class TownHallEngine:
                     workspace=effective_workspace,
                     timeout_seconds=turn_timeout(),
                     read_only=True,
+                    cancel_event=cancel,
                 )
             )
             record.turns.append(res)

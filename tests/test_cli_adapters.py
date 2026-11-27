@@ -302,7 +302,7 @@ out_dir = Path({str(markers_dir)!r})
 if mode == "gemini":
     Path("rogue_gemini_edit.txt").write_text("oops", encoding="utf-8")
 
-if "vote for ONE complementary 4th guest model" in prompt or "Allowed 4th guest models" in prompt:
+if "vote for ONE complementary guest model" in prompt or "Allowed guest models" in prompt:
     out = json.dumps({{"primary": "opencode-go/qwen4-max", "reason": "great second opinion"}})
 elif "Return the closing JSON report." in prompt:
     out = json.dumps({{
@@ -367,3 +367,62 @@ def test_cli_adapters_command_lists_providers(capsys):
     out = capsys.readouterr().out
     for name in ("claude-code", "codex", "gemini", "opencode"):
         assert name in out
+
+
+def test_empty_workspace_uses_isolated_temp_cwd_and_codex_skip_git_check(tmp_path):
+    fake_codex = _write_fake_cli(
+        tmp_path,
+        "fake_codex_empty",
+        """
+import json, os, sys
+sys.stdin.read()
+print(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "entries": os.listdir(os.getcwd())}))
+""",
+    )
+    adapter = CodexCLIAdapter(binary=fake_codex)
+    req = TurnRequest(
+        session_id="s-empty",
+        phase="independent",
+        round_num=1,
+        participant=Participant(id="codex", name="Codex", provider="codex", model="gpt-5.6-astra"),
+        system_prompt="sys",
+        user_prompt="user",
+        workspace="",
+    )
+    res = adapter.run_turn(req)
+    assert res.ok, res.error
+    info = json.loads(res.content)
+    assert "--skip-git-repo-check" in info["argv"]
+    assert Path(info["cwd"]).resolve() != Path.cwd().resolve()
+    assert info["entries"] == []
+
+
+def test_cli_adapter_kills_subprocess_promptly_on_cancel(tmp_path):
+    import time
+
+    sleeper = _write_fake_cli(
+        tmp_path,
+        "slow_cli",
+        "import time\ntime.sleep(30)\n",
+    )
+    cancel = threading.Event()
+    threading.Timer(0.25, cancel.set).start()
+
+    adapter = OpenCodeCLIAdapter(binary=sleeper)
+    req = TurnRequest(
+        session_id="s-cancel",
+        phase="independent",
+        round_num=1,
+        participant=Participant(id="oc", name="OpenCode", provider="opencode", model="m"),
+        system_prompt="sys",
+        user_prompt="user",
+        workspace="",
+        timeout_seconds=30.0,
+        cancel_event=cancel,
+    )
+    t0 = time.monotonic()
+    res = adapter.run_turn(req)
+    elapsed = time.monotonic() - t0
+    assert not res.ok
+    assert res.error == "Cancelled"
+    assert elapsed < 4.0
