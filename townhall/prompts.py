@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from .models import ConsensusSelection, Participant, TurnResult
 
+# Keep combined prompts safely below Windows CreateProcess's 32,767-char CLI arg
+# limit (used by `agy -p <prompt>` and `opencode run ... <prompt>`).
+MAX_COMBINED_PROMPT_CHARS = 22000
+
 _LANG_NOTE = {
     "es": "Respond in Spanish (clear, concise, technical).",
     "en": "Respond in English (clear, concise, technical).",
@@ -14,6 +18,42 @@ def _lang_instruction(lang: str) -> str:
     return _LANG_NOTE.get((lang or "en").lower()[:2], _LANG_NOTE["en"])
 
 
+def _clip_text(text: str, limit: int) -> str:
+    cleaned = (text or "").strip()
+    if limit <= 0 or len(cleaned) <= limit:
+        return cleaned
+    marker = "\n… [truncated for prompt budget]"
+    cut = max(80, limit - len(marker))
+    return cleaned[:cut].rstrip() + marker
+
+
+def _budget_turns(
+    turns: list[TurnResult],
+    *,
+    budget_chars: int,
+    formatter,
+) -> str:
+    """Format turns within `budget_chars`, keeping later turns fuller than older ones."""
+    ok_turns = [t for t in turns if t.ok]
+    if not ok_turns:
+        return ""
+    raw_blocks = [formatter(t, t.content.strip()) for t in ok_turns]
+    if sum(len(b) for b in raw_blocks) + 2 * len(raw_blocks) <= budget_chars:
+        return "\n\n".join(raw_blocks)
+
+    # Allocate higher weight to the final round (e.g. debate > independent) so the
+    # synthesis or next turn always sees the latest refined positions cleanly.
+    n = len(ok_turns)
+    weights = [2 if idx >= n // 2 else 1 for idx in range(n)]
+    total_w = sum(weights)
+    blocks: list[str] = []
+    for t, w in zip(ok_turns, weights, strict=True):
+        header_overhead = len(formatter(t, "")) + 4
+        share = max(400, int((budget_chars * w) / total_w) - header_overhead)
+        blocks.append(formatter(t, _clip_text(t.content, share)))
+    return "\n\n".join(blocks)
+
+
 def vote_guest_prompts(
     topic: str,
     guest_pool: list[str],
@@ -22,7 +62,7 @@ def vote_guest_prompts(
 ) -> tuple[str, str]:
     system = (
         "You are participating in a multi-model Town Hall. "
-        "Your first job is to vote for ONE complementary 4th guest model from the exact "
+        "Your first job is to vote for ONE complementary guest model from the exact "
         "candidate list below that will add the strongest independent perspective for this task. "
         "Reply ONLY with a JSON object with keys: "
         '{"primary": "<exact model id>", "secondary": "<different exact model id>", "reason": "<1 short sentence>"}.'
@@ -31,7 +71,7 @@ def vote_guest_prompts(
     user = (
         f"You are {participant.name} ({participant.model}).\n"
         f"Topic / task:\n{topic}\n\n"
-        f"Allowed 4th guest models (pick exact IDs from this list only):\n{pool_lines}\n\n"
+        f"Allowed guest models (pick exact IDs from this list only):\n{pool_lines}\n\n"
         f"{_lang_instruction(language)}"
     )
     return system, user
@@ -81,14 +121,17 @@ def debate_prompts(
         "peer gives stronger evidence. Stay strictly read-only. "
         + _lang_instruction(language)
     )
-    peers_block = "\n\n".join(
-        f"### {t.participant_name} ({t.model})\n{t.content.strip()}"
-        for t in peer_turns
-        if t.ok
+    own_budget = 4500
+    peers_budget = max(4000, MAX_COMBINED_PROMPT_CHARS - len(system) - len(topic) - own_budget - 800)
+    own_text = _clip_text(own_previous, own_budget) or "(no previous response)"
+    peers_block = _budget_turns(
+        peer_turns,
+        budget_chars=peers_budget,
+        formatter=lambda t, body: f"### {t.participant_name} ({t.model})\n{body}",
     )
     user = (
         f"Topic / task:\n{topic}\n\n"
-        f"Your previous position ({participant.name}):\n{own_previous.strip() or '(no previous response)'}\n\n"
+        f"Your previous position ({participant.name}):\n{own_text}\n\n"
         f"Other participants' positions:\n{peers_block}\n\n"
         "Respond concisely with:\n"
         "1. Where you agree with peers\n"
@@ -113,10 +156,11 @@ def open_floor_prompts(
         "Stay strictly read-only. "
         + _lang_instruction(language)
     )
-    transcript = "\n\n".join(
-        f"### Turn {t.round_num} — {t.participant_name} ({t.model})\n{t.content.strip()}"
-        for t in history
-        if t.ok
+    hist_budget = max(4000, MAX_COMBINED_PROMPT_CHARS - len(system) - len(topic) - 700)
+    transcript = _budget_turns(
+        history,
+        budget_chars=hist_budget,
+        formatter=lambda t, body: f"### Turn {t.round_num} — {t.participant_name} ({t.model})\n{body}",
     )
     hist_block = transcript if transcript else "(You are opening the floor.)"
     user = (
@@ -159,13 +203,17 @@ def synthesis_prompts(
             for v in guest_selection.votes
         )
         guest_block = (
-            f"\n4th guest selection: {guest_selection.chosen_model} "
+            f"\nConsensus guest selection: {guest_selection.chosen_model} "
             f"(method: {guest_selection.method})\n{vote_lines}\n"
         )
-    transcript_block = "\n\n".join(
-        f"### [{t.phase} #{t.round_num}] {t.participant_name} ({t.model})\n{t.content.strip()}"
-        for t in turns
-        if t.ok and t.phase != "vote_guest"
+    substantive = [t for t in turns if t.ok and t.phase != "vote_guest"]
+    transcript_budget = max(
+        6000, MAX_COMBINED_PROMPT_CHARS - len(system) - len(topic) - len(guest_block) - 700
+    )
+    transcript_block = _budget_turns(
+        substantive,
+        budget_chars=transcript_budget,
+        formatter=lambda t, body: f"### [{t.phase} #{t.round_num}] {t.participant_name} ({t.model})\n{body}",
     )
     budget_note = (
         "\nNote: The session time budget was reached before all planned rounds completed; "
