@@ -254,3 +254,79 @@ class SessionRecord:
             "budget_reached": self.budget_reached,
             "error": self.error,
         }
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    """Configuration for a recurring Town Hall session (e.g. weekly project review)."""
+
+    id: str
+    name: str
+    topic: str
+    participants: list[Participant]
+    mode: SessionMode = "council"
+    workspace: str = ""
+    guest_pool: list[str] = field(default_factory=list)
+    guest_provider: str = "opencode"
+    debate_rounds: int = 1
+    max_turns: int = 8
+    max_duration_seconds: float = 600.0
+    turn_timeout_seconds: float = 180.0
+    moderator_id: str = ""
+    language: str = "es"
+    interval_hours: float = 168.0       # default: weekly (7 * 24h)
+    allowed_hours: str = ""             # e.g. "09:00-21:00" (empty = anytime)
+    enabled: bool = True
+    last_run_at: float = 0.0
+    last_session_id: str = ""
+    created_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError("schedule name must not be empty")
+        if not self.topic or not self.topic.strip():
+            raise ValueError("schedule topic must not be empty")
+        if self.interval_hours <= 0:
+            raise ValueError("interval_hours must be > 0")
+        if len(self.participants) < 2:
+            raise ValueError("at least 2 participants are required")
+
+    def to_session_config(self) -> SessionConfig:
+        return SessionConfig(
+            topic=self.topic,
+            participants=list(self.participants),
+            mode=self.mode,
+            workspace=self.workspace,
+            guest_pool=list(self.guest_pool),
+            guest_provider=self.guest_provider,
+            debate_rounds=self.debate_rounds,
+            max_turns=self.max_turns,
+            max_duration_seconds=self.max_duration_seconds,
+            turn_timeout_seconds=self.turn_timeout_seconds,
+            moderator_id=self.moderator_id,
+            language=self.language,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "topic": self.topic,
+            "mode": self.mode,
+            "workspace": self.workspace,
+            "participants": [p.to_dict() for p in self.participants],
+            "guest_pool": list(self.guest_pool),
+            "guest_provider": self.guest_provider,
+            "debate_rounds": self.debate_rounds,
+            "max_turns": self.max_turns,
+            "max_duration_seconds": self.max_duration_seconds,
+            "turn_timeout_seconds": self.turn_timeout_seconds,
+            "moderator_id": self.moderator_id,
+            "language": self.language,
+            "interval_hours": self.interval_hours,
+            "allowed_hours": self.allowed_hours,
+            "enabled": self.enabled,
+            "last_run_at": self.last_run_at,
+            "last_session_id": self.last_session_id,
+            "created_at": self.created_at,
+        }

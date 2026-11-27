@@ -13,6 +13,7 @@ from .models import (
     ConsensusSelection,
     GuestVote,
     Participant,
+    ScheduleSpec,
     SessionRecord,
     TurnResult,
 )
@@ -66,6 +67,29 @@ CREATE TABLE IF NOT EXISTS turns (
     error TEXT NOT NULL DEFAULT '',
     tokens_in INTEGER NOT NULL DEFAULT 0,
     tokens_out INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'council',
+    workspace TEXT NOT NULL DEFAULT '',
+    participants_json TEXT NOT NULL,
+    guest_pool_json TEXT NOT NULL DEFAULT '[]',
+    guest_provider TEXT NOT NULL DEFAULT 'opencode',
+    debate_rounds INTEGER NOT NULL DEFAULT 1,
+    max_turns INTEGER NOT NULL DEFAULT 8,
+    max_duration_seconds REAL NOT NULL DEFAULT 600.0,
+    turn_timeout_seconds REAL NOT NULL DEFAULT 180.0,
+    moderator_id TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'es',
+    interval_hours REAL NOT NULL DEFAULT 168.0,
+    allowed_hours TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at REAL NOT NULL DEFAULT 0,
+    last_session_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0
 );
 
@@ -282,6 +306,116 @@ class TownHallStore:
                 (max(1, int(limit)),),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------ schedules
+    def save_schedule(self, spec: ScheduleSpec) -> None:
+        now = spec.created_at or time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO schedules (
+                    id, name, topic, mode, workspace, participants_json,
+                    guest_pool_json, guest_provider, debate_rounds, max_turns,
+                    max_duration_seconds, turn_timeout_seconds, moderator_id,
+                    language, interval_hours, allowed_hours, enabled,
+                    last_run_at, last_session_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    topic=excluded.topic,
+                    mode=excluded.mode,
+                    workspace=excluded.workspace,
+                    participants_json=excluded.participants_json,
+                    guest_pool_json=excluded.guest_pool_json,
+                    guest_provider=excluded.guest_provider,
+                    debate_rounds=excluded.debate_rounds,
+                    max_turns=excluded.max_turns,
+                    max_duration_seconds=excluded.max_duration_seconds,
+                    turn_timeout_seconds=excluded.turn_timeout_seconds,
+                    moderator_id=excluded.moderator_id,
+                    language=excluded.language,
+                    interval_hours=excluded.interval_hours,
+                    allowed_hours=excluded.allowed_hours,
+                    enabled=excluded.enabled
+                """,
+                (
+                    spec.id,
+                    spec.name,
+                    spec.topic,
+                    spec.mode,
+                    spec.workspace,
+                    json.dumps([p.to_dict() for p in spec.participants], ensure_ascii=False),
+                    json.dumps(list(spec.guest_pool), ensure_ascii=False),
+                    spec.guest_provider,
+                    spec.debate_rounds,
+                    spec.max_turns,
+                    spec.max_duration_seconds,
+                    spec.turn_timeout_seconds,
+                    spec.moderator_id,
+                    spec.language,
+                    spec.interval_hours,
+                    spec.allowed_hours,
+                    1 if spec.enabled else 0,
+                    spec.last_run_at,
+                    spec.last_session_id,
+                    now,
+                ),
+            )
+
+    def _row_to_schedule(self, row: sqlite3.Row) -> ScheduleSpec:
+        return ScheduleSpec(
+            id=row["id"],
+            name=row["name"],
+            topic=row["topic"],
+            participants=[Participant.from_dict(p) for p in json.loads(row["participants_json"])],
+            mode=row["mode"],
+            workspace=row["workspace"],
+            guest_pool=json.loads(row["guest_pool_json"] or "[]"),
+            guest_provider=row["guest_provider"],
+            debate_rounds=int(row["debate_rounds"]),
+            max_turns=int(row["max_turns"]),
+            max_duration_seconds=float(row["max_duration_seconds"]),
+            turn_timeout_seconds=float(row["turn_timeout_seconds"]),
+            moderator_id=row["moderator_id"],
+            language=row["language"],
+            interval_hours=float(row["interval_hours"]),
+            allowed_hours=row["allowed_hours"],
+            enabled=bool(row["enabled"]),
+            last_run_at=float(row["last_run_at"]),
+            last_session_id=row["last_session_id"],
+            created_at=float(row["created_at"]),
+        )
+
+    def get_schedule(self, schedule_id: str) -> ScheduleSpec | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+        return self._row_to_schedule(row) if row is not None else None
+
+    def list_schedules(self) -> list[ScheduleSpec]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM schedules ORDER BY created_at DESC, id ASC").fetchall()
+        return [self._row_to_schedule(r) for r in rows]
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE schedules SET enabled = ? WHERE id = ?",
+                (1 if enabled else 0, schedule_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_schedule_run(self, schedule_id: str, run_at: float, session_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE schedules SET last_run_at = ?, last_session_id = ? WHERE id = ?",
+                (float(run_at), session_id, schedule_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+            return cur.rowcount > 0
 
 
 def render_markdown(record: SessionRecord) -> str:
