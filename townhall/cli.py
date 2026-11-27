@@ -1,4 +1,4 @@
-"""Command-line interface for Town Hall (`townhall demo|list|show|export`)."""
+"""Command-line interface for Town Hall (`townhall run|demo|adapters|list|show|export`)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .adapter import DemoAdapter
+from .cli_adapters import build_default_adapters, discover_adapters
 from .engine import TownHallEngine
 from .models import Participant, SessionConfig, SessionEvent
 from .store import TownHallStore, render_markdown
@@ -27,25 +28,47 @@ def default_db_path() -> Path:
     return Path.home() / ".townhall" / "townhall.sqlite3"
 
 
-def default_core_participants() -> list[Participant]:
+def default_core_participants(
+    *,
+    gemini_model: str = "gemini-4-neon",
+    codex_model: str = "gpt-5.6-astra",
+    claude_model: str = "claude-opus",
+) -> list[Participant]:
     return [
-        Participant(id="gemini", name="Gemini", provider="gemini", model="gemini-4-neon", role="core"),
-        Participant(id="codex", name="Codex", provider="codex", model="gpt-5.6-astra", role="core"),
-        Participant(id="claude", name="Claude", provider="claude-code", model="claude-opus", role="core"),
+        Participant(id="gemini", name="Gemini", provider="gemini", model=gemini_model, role="core"),
+        Participant(id="codex", name="Codex", provider="codex", model=codex_model, role="core"),
+        Participant(id="claude", name="Claude", provider="claude-code", model=claude_model, role="core"),
     ]
 
 
 def _print_event(ev: SessionEvent) -> None:
-    if ev.type == "phase_started":
+    if ev.type == "session_started" and ev.payload.get("workspace_isolated"):
+        print("-> Isolated disposable git worktree created (read-only guard active)")
+    elif ev.type == "phase_started":
         print(f"-> Phase: {ev.payload.get('phase')} (round {ev.payload.get('round_num')})")
     elif ev.type == "guest_selected":
         print(
             f"-> 4th guest chosen by {ev.payload.get('method')}: "
             f"{ev.payload.get('chosen_model')}"
         )
+    elif ev.type == "budget_reached":
+        print("-> Time budget reached; moving to synthesis")
     elif ev.type == "turn_completed":
         status = "ok" if ev.payload.get("ok") else f"error: {ev.payload.get('error')}"
         print(f"   [{ev.payload.get('participant_name')}] {status}")
+
+
+def _add_session_flags(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("topic", help="Question or review prompt for the Town Hall.")
+    subparser.add_argument("--workspace", default="", help="Project folder to inspect (read-only).")
+    subparser.add_argument("--mode", choices=["council", "open_floor"], default="council")
+    subparser.add_argument("--rounds", type=int, default=1, help="Cross-critique rounds in council mode (0-3).")
+    subparser.add_argument("--max-turns", type=int, default=6, help="Turn cap in open_floor mode.")
+    subparser.add_argument("--max-seconds", type=float, default=600.0, help="Hard session duration budget.")
+    subparser.add_argument("--turn-timeout", type=float, default=180.0, help="Per-turn CLI timeout in seconds.")
+    subparser.add_argument("--moderator", default="claude", help="Participant ID that writes the final synthesis.")
+    subparser.add_argument("--lang", default="es", choices=["es", "en"])
+    subparser.add_argument("--no-guest", action="store_true", help="Skip Phase 0 guest-model election.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,14 +76,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default="", help="Path to SQLite database (default: ~/.townhall/townhall.sqlite3)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    run_p = sub.add_parser("run", help="Run a live read-only Town Hall using local CLIs.")
+    _add_session_flags(run_p)
+    run_p.add_argument("--gemini-model", default="", help="Model passed to `agy` (empty = CLI default).")
+    run_p.add_argument("--codex-model", default="", help="Model passed to `codex` (empty = CLI default).")
+    run_p.add_argument("--claude-model", default="", help="Model passed to `claude` (empty = CLI default).")
+    run_p.add_argument(
+        "--guest-pool",
+        default=",".join(DEFAULT_GUEST_POOL),
+        help="Comma-separated list of allowed OpenCode guest model IDs.",
+    )
+    run_p.add_argument("--no-worktree", action="store_true", help="Disable disposable git worktree isolation.")
+
     demo = sub.add_parser("demo", help="Run an offline simulated 4-agent Town Hall session.")
-    demo.add_argument("topic", help="Question or review prompt for the Town Hall.")
-    demo.add_argument("--mode", choices=["council", "open_floor"], default="council")
-    demo.add_argument("--rounds", type=int, default=1, help="Cross-critique rounds in council mode (0-3).")
-    demo.add_argument("--max-turns", type=int, default=6, help="Turn cap in open_floor mode.")
-    demo.add_argument("--max-seconds", type=float, default=120.0, help="Hard session duration budget.")
-    demo.add_argument("--moderator", default="claude", help="Participant ID that writes the final synthesis.")
-    demo.add_argument("--lang", default="es", choices=["es", "en"])
+    _add_session_flags(demo)
+
+    sub.add_parser("adapters", help="Show which local AI CLIs are detected on this computer.")
 
     ls = sub.add_parser("list", help="List saved Town Hall sessions.")
     ls.add_argument("--limit", type=int, default=20)
@@ -76,28 +107,56 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.cmd == "adapters":
+        found = discover_adapters()
+        for name, path in found.items():
+            print(f"{name:12s}  {path or 'not found'}")
+        return 0
+
     db_path = Path(args.db) if args.db else default_db_path()
     store = TownHallStore(db_path)
 
-    if args.cmd == "demo":
+    if args.cmd in ("demo", "run"):
+        if args.cmd == "demo":
+            participants = default_core_participants()
+            guest_pool = [] if args.no_guest else list(DEFAULT_GUEST_POOL)
+            adapter = DemoAdapter()
+            isolate = False
+        else:
+            participants = default_core_participants(
+                gemini_model=args.gemini_model,
+                codex_model=args.codex_model,
+                claude_model=args.claude_model,
+            )
+            guest_pool = (
+                []
+                if args.no_guest
+                else [m.strip() for m in args.guest_pool.split(",") if m.strip()]
+            )
+            adapter = build_default_adapters()
+            isolate = not args.no_worktree
+
         config = SessionConfig(
             topic=args.topic,
-            participants=default_core_participants(),
+            participants=participants,
             mode=args.mode,
-            guest_pool=list(DEFAULT_GUEST_POOL),
+            workspace=args.workspace,
+            guest_pool=guest_pool,
             debate_rounds=args.rounds,
             max_turns=args.max_turns,
             max_duration_seconds=args.max_seconds,
+            turn_timeout_seconds=args.turn_timeout,
             moderator_id=args.moderator,
             language=args.lang,
+            isolate_workspace=isolate,
         )
-        engine = TownHallEngine(DemoAdapter(), on_event=_print_event)
+        engine = TownHallEngine(adapter, on_event=_print_event)
         record = engine.run(config)
         store.save(record)
         print()
         print(render_markdown(record))
         print(f"Saved session `{record.id}` in {db_path}")
-        return 0
+        return 0 if record.status == "completed" else 1
 
     if args.cmd == "list":
         rows = store.list_sessions(limit=args.limit)

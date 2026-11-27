@@ -329,6 +329,8 @@ def render_markdown(record: SessionRecord) -> str:
     for t in record.turns:
         if t.phase == "vote_guest":
             continue
+        if t.phase == "synthesis" and record.conclusion is not None:
+            continue
         lines.append(f"### [{t.phase} · round {t.round_num}] {t.participant_name} (`{t.model}`)")
         lines.append("")
         if t.error:
